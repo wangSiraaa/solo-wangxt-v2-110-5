@@ -15,9 +15,14 @@ import { config, fixtureOrigin } from './config.js';
 export function buildFixtureApp() {
   const app = Fastify({ logger: { name: 'fixture', level: 'warn' } });
 
-  // FIXTURE_MODE=fixed 模拟“运维按整改单修复旧站配置后”的线上状态：
-  // 长链改直跳、环被打断。默认模式保留全部缺陷用于演示检测能力。
-  const fixed = process.env.FIXTURE_MODE === 'fixed';
+  // FIXTURE_MODE 模拟站点侧修复进度（环境差异，不影响运行的输入兼容性）：
+  //  - 默认：保留全部缺陷（环、长链），用于演示检测能力；
+  //  - fixloop：只修复重定向环——/loop/b 变成可服务的最终页（200），
+  //    /loop/a 仍 301 到 /loop/b；长链保持缺陷，用于演示“只修了环”的对比；
+  //  - fixed：长链改直跳、环打断直跳文章页（配合 remediate.js 更新映射目标）。
+  const mode = process.env.FIXTURE_MODE ?? 'default';
+  const fixed = mode === 'fixed';
+  const fixLoop = mode === 'fixloop';
 
   // 新站正文页
   const newPages = new Set([
@@ -26,6 +31,8 @@ export function buildFixtureApp() {
     '/sections/weekly',
     '/files%2Fdraft',
     '/chain/7',
+    // fixloop：环在 b 处被打断，b 成为真实落地页
+    ...(fixLoop ? ['/loop/b'] : []),
   ]);
   const pageTitles = {
     '/articles/tech/42': '科技频道文章 42',
@@ -33,6 +40,7 @@ export function buildFixtureApp() {
     '/sections/weekly': '周刊栏目',
     '/files%2Fdraft': '文件名中带斜杠字符的草稿页（编码斜杠是合法文件名）',
     '/chain/7': '长链终点页',
+    '/loop/b': '环已修复：/loop/b 现在是最终内容页',
   };
 
   /**
@@ -45,11 +53,12 @@ export function buildFixtureApp() {
     ['/news/123', '/articles/123'],
     ['/column/weekly/', '/sections/weekly'],
     ['/old-files%2Fdraft', '/files%2Fdraft'],
-    // 修复模式：长链改直跳、环打断；默认模式保留缺陷
+    // 修复模式：fixed=长链直跳+环直跳文章页；fixloop=只修环（b 成最终页）；默认保留缺陷
     ...(fixed
       ? [
           ['/chain/0', '/chain/7'],
           ['/loop/a', '/articles/tech/42'],
+          ['/loop/b', '/loop/a'],
         ]
       : [
           ['/chain/0', '/chain/1'],
@@ -60,8 +69,9 @@ export function buildFixtureApp() {
           ['/chain/5', '/chain/6'],
           ['/chain/6', '/chain/7'],
           ['/loop/a', '/loop/b'],
+          // fixloop 时 /loop/b 是 200 内容页（见 newPages），不再回指 /loop/a
+          ...(fixLoop ? [] : [['/loop/b', '/loop/a']]),
         ]),
-    ['/loop/b', '/loop/a'],
   ]);
 
   /** 已删除栏目：永久消失，正确状态是 410 Gone（不是 301 到首页） */

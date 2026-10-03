@@ -17,11 +17,24 @@ export const api = {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ urls }),
     }).then(j),
-  verify: (sourceNorm = null) =>
-    fetch('/api/verify', {
+  // 版本化验证运行
+  runs: () => fetch('/api/runs').then(j),
+  startRun: (payload = {}) =>
+    fetch('/api/runs', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(sourceNorm ? { source_norm: sourceNorm } : {}),
+      body: JSON.stringify(payload),
     }).then(j),
+  run: (id) => fetch(`/api/runs/${id}`).then(j),
+  cancelRun: (id) => fetch(`/api/runs/${id}/cancel`, { method: 'POST' }).then(j),
+  runHops: (id, key) =>
+    fetch(`/api/runs/${id}/hops/${encodeURIComponent(key)}`).then(j),
+  compareRuns: (baseId, headId) =>
+    fetch('/api/runs/compare', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ base_id: baseId, head_id: headId }),
+    }).then(j),
+  runReportUrl: (id) => `/api/runs/${id}/report`,
+  compareReportUrl: (base, head) => `/api/runs/compare/report?base=${base}&head=${head}`,
   crawl: (key) =>
     fetch('/api/crawl/' + encodeURIComponent(key)).then(j),
   plans: () => fetch('/api/plans').then(j),

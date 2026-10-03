@@ -24,6 +24,12 @@
 5. **PostgreSQL 保存三类数据**：旧新映射（原始材料 `mapping_inputs` + 生效表
    `url_mappings`）、爬取逐跳结果（`crawl_results`）、迁移方案（`migration_plans`
    / `migration_plan_items`），另存每入口最终裁决 `verification_verdicts`。
+6. **版本化运行历史**（`verification_runs` / `run_items`，见 `server/src/run-service.js`
+   与 `verify-runner.js`）：每次验证是一次冻结运行——输入映射版本（内容哈希+快照）、
+   规范化与白名单策略版本、选择范围、逐跳链、最终裁决全部留档，终态明确为
+   `complete` / `failed` / `cancelled`。**只有 complete 且与当前映射/策略兼容的
+   全量运行才能作为发布基线**；中断、超时或局部失败的运行保留诊断，
+   但绝不替换最后一个完整基线（`verification_verdicts` 只被完整全量运行整体替换）。
 
 ## 快速开始
 
@@ -36,9 +42,9 @@ npm run pg:start        # 启动 tools/ 下的本地 PostgreSQL（127.0.0.1:5543
 npm run migrate         # 建库 + 建表
 npm run seed            # 写入 10 条演示录入（含全部异常场景）
 
-npm test                # 19 项测试：规范化规则 + 验证器集成（真实启动本地站点）
-npm run verify          # CLI：对全部映射真实请求验证并给出裁决
-node scripts/report.js  # 产出 docs/verification-report-before.md 风格的证据报告
+npm test                # 28 项测试：规范化规则 + 验证器集成 + 运行历史验收（真实站点/真实库）
+npm run verify          # CLI：执行一次版本化验证运行并给出裁决（complete 才推进基线）
+node scripts/report.js  # 产出带运行标识与输入摘要的证据报告
 
 npm start               # 本地站点 + API + 已构建的前端
                         # 工作台 http://127.0.0.1:4567 （仅监听 127.0.0.1）
@@ -81,8 +87,32 @@ FIXTURE_MODE=fixed node scripts/report.js
 ```
 
 工作台里的“迁移方案”也遵循同样闸门：纳入方案只是 `pending`，
-`build` 时按最新裁决标注 `verified/blocked`；`publish` 时只要存在
-blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 + 受影响链接清单**。
+`build` 时按**当前基线运行**的裁决标注 `verified/blocked` 并记录 `baseline_run_id`；
+`publish` 时只要存在 blocked/pending、未纳入的生效映射、未裁决歧义，
+或**基线运行已不完整 / 与当前映射策略不兼容 / 被更新完整运行取代**，
+就返回 **409 + 受影响链接清单**。
+
+## 版本化运行历史与对比（验收场景）
+
+“运行历史 / 对比”页回答一个问题：**这次验证是真的修好了，还是换了映射/规则把旧证据覆盖了**。
+
+- 每次运行冻结：映射版本（`sha256` 内容哈希 + 快照）、策略版本（规范化/白名单/爬取预算）、
+  选择范围（全量或指定键）、逐跳链与裁决；`FIXTURE_MODE` 只是环境标签，
+  **站点侧修复不会让新旧运行变得不可比较**。
+- 两个运行只有映射版本与策略版本都一致才可比较；比较按同一原始入口与归一化键对齐，
+  分桶为**已修复 / 状态回退 / 新增失败 / 不可比较**，并给出“稳定（无业务变化）”结论。
+- 取消（`POST /api/runs/:id/cancel`）、本地站点预检失败、连续网络错误/超时，
+  都会让运行以 `cancelled`/`failed` 终态留档（含诊断与已完成条目证据），
+  发布闸门仍使用上一个完整兼容运行，绝不假装成功。
+- 映射或策略一变，旧运行立即失去基线资格：对比接口明确返回“输入不兼容”，
+  方案 `publish` 拒绝旧 run 放行；服务重启时仍在 `running` 的运行被标记 `failed`。
+
+```bash
+# 演示：① 连续两次完整运行 → 稳定比较
+npm run verify && npm run verify
+# ② 只修重定向环（站点侧），新运行只把 /loop/a 列为“已修复”
+FIXTURE_MODE=fixloop npm start   # 然后在“运行历史 / 对比”页选两次运行比较
+```
 
 ## API 摘要
 
@@ -90,15 +120,19 @@ blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 +
 |---|---|
 | `POST /api/normalize` | 规范化试算（不写库） |
 | `GET/POST /api/mappings` | 原始录入材料 / 录入一条（自动重算生效与冲突） |
-| `POST /api/verify` | 对全部（或指定 `source_norm`）真实验证 |
-| `GET /api/crawl/:key` | 查看某条链接的逐跳证据 |
-| `GET/POST /api/plans`、`POST /api/plans/:id/build`、`POST /api/plans/:id/publish` | 方案与发布闸门 |
+| `POST /api/verify` | 启动一次运行并等待终态（CLI 风格） |
+| `GET/POST /api/runs`、`GET /api/runs/:id`、`POST /api/runs/:id/cancel` | 版本化运行历史：列表 / 启动 / 详情 / 取消 |
+| `GET /api/runs/:id/hops/:key` | 某次运行中某入口的冻结逐跳链 |
+| `POST /api/runs/compare` | 比较两个运行（不兼容时明确拒绝并给出原因） |
+| `GET /api/runs/:id/report`、`GET /api/runs/compare/report?base=&head=` | 导出 Markdown 报告（带运行标识与输入摘要） |
+| `GET /api/crawl/:key` | 当前基线的逐跳证据 |
+| `GET/POST /api/plans`、`POST /api/plans/:id/build`、`POST /api/plans/:id/publish` | 方案与发布闸门（详情含运行链与基线资格说明） |
 
 ## 环境变量（见 `.env.example`）
 
 `HOST/PORT`（API）、`FIXTURE_HOST/PORT`（本地站点）、`PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE`、
 `TRAILING_SLASH_MODE`（默认 `keep`）、`MAX_REDIRECTS`（默认 5）、`HTTP_TIMEOUT_MS`、
-`FIXTURE_MODE`（`fixed` = 模拟整改后站点）。
+`FIXTURE_MODE`（`fixloop` = 只修重定向环；`fixed` = 模拟整改后站点）。
 
 ## 自备 PostgreSQL
 
@@ -119,12 +153,13 @@ cd /workspace && npm run pg:start
 ## 目录
 
 ```
-server/src/   normalize.js(规范化规则) verifier.js(白名单/环/长链/最终状态)
-              ambiguity.js mappings-service.js verify-runner.js
-              fixture.js(随项目本地站点) routes.js(Fastify) db.js
+server/src/   normalize.js(规范化规则) verifier.js(白名单/环/长链/最终状态/预检)
+              ambiguity.js mappings-service.js verify-runner.js(运行引擎)
+              run-service.js(版本指纹/基线/对比/报告) fixture.js(随项目本地站点)
+              routes.js(Fastify) db.js
 server/sql/   schema.sql
-web/          Vue 3 + Vite 工作台（总览/证据/方案闸门/规则四页）
+web/          Vue 3 + Vite 工作台（总览/证据/运行历史与对比/方案闸门/规则五页）
 scripts/      start-pg.js remediate.js report.js
 docs/         verification-report-before.md / -after.md（真实跑出来的证据）
-server/test/  规则单测 + 验证器集成测试（19 项）
+server/test/  规则单测 + 验证器集成 + 运行历史验收（28 项）
 ```

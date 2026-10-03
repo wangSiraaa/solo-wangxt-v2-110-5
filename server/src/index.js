@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import { ensureDatabase, pool } from './db.js';
 import { startFixture } from './fixture.js';
+import { markInterruptedRuns } from './run-service.js';
 import apiRoutes from './routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 async function main() {
   const fixture = await startFixture();
   await ensureDatabase();
+  // 上次进程退出时仍在进行的运行：标记 failed（诊断保留，绝不冒充完整基线）
+  const interrupted = await markInterruptedRuns();
+  if (interrupted) console.log(`marked ${interrupted} interrupted run(s) as failed`);
 
   const app = Fastify({ logger: { name: 'workbench', level: 'info' } });
   await app.register(apiRoutes);

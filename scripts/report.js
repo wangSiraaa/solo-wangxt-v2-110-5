@@ -1,14 +1,16 @@
 /**
  * 生成“发布前受影响链接与验证证据”报告：docs/verification-report.md
  *   node scripts/report.js
- * 会真实启动本地站点并跑一轮验证；报告基于数据库中的逐跳证据，不凭空下结论。
+ * 会真实启动本地站点并执行一次版本化验证运行；报告基于该运行冻结的
+ * 逐跳证据（run_items），带运行标识与输入摘要，不凭空下结论。
  */
 import { writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pool } from '../server/src/db.js';
 import { buildFixtureApp } from '../server/src/fixture.js';
-import { runVerification, VERDICT_LABEL } from '../server/src/verify-runner.js';
+import { startRun, waitForRun, getRunItems, VERDICT_LABEL } from '../server/src/verify-runner.js';
+import { summarizeRun, markInterruptedRuns } from '../server/src/run-service.js';
 import { config } from '../server/src/config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,21 +21,15 @@ const fixtureMode = process.env.FIXTURE_MODE === 'fixed' ? 'fixed（整改修复
 const fixture = await buildFixtureApp();
 await fixture.listen({ host: config.fixture.host, port: config.fixture.port });
 try {
-  await runVerification();
-
-  const { rows: verdicts } = await pool.query(
-    'SELECT * FROM verification_verdicts ORDER BY source_norm');
-  const { rows: hops } = await pool.query(
-    'SELECT * FROM crawl_results ORDER BY source_norm, hop_index');
+  await markInterruptedRuns();
+  const run = await startRun();
+  const final = await waitForRun(run.id);
+  const s = summarizeRun(final);
+  const items = await getRunItems(run.id);
   const { rows: amb } = await pool.query('SELECT * FROM mapping_ambiguities ORDER BY source_norm');
-  const hopsBy = new Map();
-  for (const h of hops) {
-    if (!hopsBy.has(h.source_norm)) hopsBy.set(h.source_norm, []);
-    hopsBy.get(h.source_norm).push(h);
-  }
 
-  const blocked = verdicts.filter((v) => !GOOD.has(v.verdict));
-  const passed = verdicts.filter((v) => GOOD.has(v.verdict));
+  const blocked = items.filter((v) => !GOOD.has(v.verdict));
+  const passed = items.filter((v) => GOOD.has(v.verdict));
   const now = new Date().toISOString();
 
   const L = {
@@ -46,18 +42,20 @@ try {
   let md = `# 栏目改版：旧链接落地验证报告（发布前证据）
 
 > 生成时间：${now}
+> **运行标识：#${s.id}（终态 ${s.status}）**
+> 输入摘要：映射版本 \`${s.mapping_version}\`（${s.mapping_count} 条生效映射，${s.conflicted_count} 条歧义）；
+> 策略版本 \`${s.policy_version}\`（尾斜杠=${s.policy_summary.tailSlashMode}，最长链=${s.policy_summary.maxRedirects}，超时=${s.policy_summary.timeoutMs}ms）
 > 验证目标白名单：\`http://${config.fixture.host}:${config.fixture.port}\`（随项目启动的本地站点，仅此一个）
 > 本地站点模式：**${fixtureMode}**
-> 最长跳转链：${config.crawl.maxRedirects} 跳；尾斜杠策略：\`${config.rules.tailSlashMode}\`（保留）
 >
-> **结论先行：${blocked.length === 0 ? '全部通过，可以发布' : `存在 ${blocked.length} 条受影响链接未通过，发布闸门保持关闭`}。**
+> **结论先行：${final.status !== 'complete' ? `运行未完整结束（${final.status}），本报告不能作为发布依据` : blocked.length === 0 ? '全部通过，可以发布' : `存在 ${blocked.length} 条受影响链接未通过，发布闸门保持关闭`}。**
 > 映射表填完不等于迁移完成——下表每条都以真实 HTTP 请求的逐跳证据为准。
-
+${(final.diagnostics ?? []).length ? `> 运行诊断：${final.diagnostics.join('；')}\n` : ''}
 ## 1. 总览
 
 | 指标 | 数量 |
 |---|---|
-| 生效映射总数（去重后归一化键） | ${verdicts.length} |
+| 生效映射总数（去重后归一化键） | ${items.length} |
 | 通过（最终页 2xx / 已删除正确 410） | ${passed.length} |
 | 阻断 | ${blocked.length} |
 | 归一化歧义组 | ${amb.length} |
@@ -68,21 +66,20 @@ try {
 |---|---|---|---|---|
 ${blocked.map((v) => `| \`${v.source_raw}\` | ${L[v.verdict] ?? VERDICT_LABEL[v.verdict] ?? v.verdict} | ${v.final_status ?? '—'} | ${v.hops} | ${(v.issues || []).join('；') || '—'} |`).join('\n') || '| （无） | | | | |'}
 
-## 3. 逐条验证证据（全部映射）
+## 3. 逐条验证证据（全部映射，运行 #${s.id} 冻结）
 
 `;
 
-  for (const v of verdicts) {
-    const hh = hopsBy.get(v.source_norm) ?? [];
+  for (const v of items) {
     md += `### ${GOOD.has(v.verdict) ? '✅' : '❌'} ${v.source_raw}\n\n`;
     md += `- 裁决：**${VERDICT_LABEL[v.verdict]}**\n`;
     md += `- 最终 URL：\`${v.final_url_raw ?? '—'}\`\n`;
     md += `- 最终状态码：**${v.final_status ?? '—'}**；跳数：${v.hops}；追踪参数保留：${v.tracker_preserved === null ? '—' : v.tracker_preserved ? '是' : '否'}\n`;
     if (v.issues?.length) md += `- 问题：${v.issues.map((x) => `\n  - ${x}`).join('')}\n`;
-    if (hh.length) {
+    if (v.hops_detail?.length) {
       md += `\n| 跳 | 请求 URL（规范化） | 状态 | Location（原样） |\n|---|---|---|---|\n`;
-      for (const h of hh) {
-        md += `| ${h.hop_index} | \`${h.url_norm}\` | ${h.status_code ?? '—'}${h.fetch_error ? `（${h.fetch_error}）` : ''} | \`${h.location_raw ?? '—'}\` |\n`;
+      for (const h of v.hops_detail) {
+        md += `| ${h.index} | \`${h.url_norm}\` | ${h.status ?? '—'}${h.fetch_error ? `（${h.fetch_error}）` : ''} | \`${h.location_raw ?? '—'}\` |\n`;
       }
     }
     md += '\n';
@@ -121,7 +118,7 @@ npm start                                            # 工作台 http://127.0.0.
   const out = join(__dirname, '..', 'docs', 'verification-report.md');
   await writeFile(out, md, 'utf8');
   console.log(`report written: ${out}`);
-  console.log(`passed=${passed.length} blocked=${blocked.length} ambiguities=${amb.length}`);
+  console.log(`run=#${s.id} status=${final.status} passed=${passed.length} blocked=${blocked.length} ambiguities=${amb.length}`);
 } finally {
   await fixture.close();
   await pool.end();

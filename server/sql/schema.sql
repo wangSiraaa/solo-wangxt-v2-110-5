@@ -73,6 +73,61 @@ CREATE TABLE IF NOT EXISTS verification_verdicts (
   verified_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ============================================================================
+-- 版本化验证运行历史
+-- 每次运行冻结：输入映射版本（内容哈希+快照）、规范化/白名单策略版本、
+-- 选择范围、逐跳链与最终裁决。终态：complete / failed / cancelled。
+-- 只有 complete 且与当前映射/策略兼容的全量运行才能作为发布基线；
+-- 中断/超时/局部失败的运行保留诊断，但绝不替换最后一个完整基线。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id                BIGSERIAL PRIMARY KEY,
+  -- running（进行中，非终态） / complete / failed / cancelled（终态）
+  status            TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running','complete','failed','cancelled')),
+  scope             TEXT NOT NULL DEFAULT 'all' CHECK (scope IN ('all','selected')),
+  scope_keys        JSONB,                     -- scope=selected 时冻结的键列表
+  -- 输入指纹：映射内容哈希 + 冻结快照（运行期间不再读 url_mappings  live 表）
+  mapping_version   TEXT NOT NULL,
+  mapping_count     INT  NOT NULL DEFAULT 0,
+  conflicted_count  INT  NOT NULL DEFAULT 0,
+  mapping_snapshot  JSONB NOT NULL,
+  -- 策略指纹：规范化规则 + 白名单 + 爬取预算
+  policy_version    TEXT NOT NULL,
+  policy_snapshot   JSONB NOT NULL,
+  fixture_mode      TEXT NOT NULL DEFAULT 'default',  -- 环境标签（不参与兼容性）
+  total             INT  NOT NULL DEFAULT 0,
+  done_count        INT  NOT NULL DEFAULT 0,
+  fail_count        INT  NOT NULL DEFAULT 0,
+  cancel_requested  BOOLEAN NOT NULL DEFAULT false,
+  diagnostics       JSONB NOT NULL DEFAULT '[]'::jsonb,
+  started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at       TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON verification_runs(status);
+
+-- 运行内逐入口结果：裁决 + 冻结的逐跳链（历史不可改，新运行不覆盖旧运行）
+CREATE TABLE IF NOT EXISTS run_items (
+  id                BIGSERIAL PRIMARY KEY,
+  run_id            BIGINT NOT NULL REFERENCES verification_runs(id) ON DELETE CASCADE,
+  source_norm       TEXT NOT NULL,
+  source_raw        TEXT NOT NULL,
+  mapping_type      TEXT,
+  target_norm       TEXT,
+  item_status       TEXT NOT NULL DEFAULT 'done' CHECK (item_status IN ('done','error')),
+  verdict           TEXT,
+  issues            JSONB NOT NULL DEFAULT '[]'::jsonb,
+  final_url_raw     TEXT,
+  final_url_norm    TEXT,
+  final_status      INT,
+  hops              INT  NOT NULL DEFAULT 0,
+  tracker_preserved BOOLEAN,
+  hops_detail       JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 冻结的逐跳证据
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (run_id, source_norm)
+);
+CREATE INDEX IF NOT EXISTS idx_run_items_run ON run_items(run_id);
+
 -- 迁移方案：填表只是 pending，验证通过才 allowed 发布。
 CREATE TABLE IF NOT EXISTS migration_plans (
   id              BIGSERIAL PRIMARY KEY,
@@ -82,6 +137,10 @@ CREATE TABLE IF NOT EXISTS migration_plans (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   published_at    TIMESTAMPTZ
 );
+-- 方案构建时所基于的基线运行（发布闸门复核其仍然 complete 且兼容）
+ALTER TABLE migration_plans ADD COLUMN IF NOT EXISTS baseline_run_id BIGINT;
+-- 当前证据表对应的来源运行（可追溯；只有完整全量运行才会推进该指针）
+ALTER TABLE verification_verdicts ADD COLUMN IF NOT EXISTS run_id BIGINT;
 
 CREATE TABLE IF NOT EXISTS migration_plan_items (
   id              BIGSERIAL PRIMARY KEY,

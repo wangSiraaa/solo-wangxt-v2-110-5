@@ -52,6 +52,18 @@ function fetchOnce(rawUrl) {
 }
 
 /**
+ * 预检：本地站点是否可达。任何 HTTP 响应（含 404）都视为可达；
+ * 连接拒绝/超时视为站点故障——此时不应开始一次完整运行，
+ * 否则所有条目都会被记成 fetch_error，污染证据。
+ */
+export async function probeSite() {
+  const res = await fetchOnce(`${fixtureOrigin()}/`);
+  return res.error == null
+    ? { ok: true, status: res.status }
+    : { ok: false, error: res.error };
+}
+
+/**
  * 跟随跳转链。
  * @param {string} entryRaw 入口原始 URL
  * @returns {Promise<object>} hops / loop / chainTooLong / final* / sourceTrackers

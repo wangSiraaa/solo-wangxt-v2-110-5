@@ -6,12 +6,19 @@
         验证器只允许访问随项目启动的本地站点（127.0.0.1:4568）；
         每一跳的状态码、Location、最终状态都落库。映射表填完<b>不等于</b>迁移完成——
         只有这里出现绿色裁决，发布闸门才可能放行。
+        每次验证是一次<b>版本化运行</b>：只有 complete 的全量运行才会替换下面的证据；
+        取消/超时/失败的运行保留在“运行历史”中，不会覆盖基线。
       </p>
       <div style="flex:1; text-align:right">
         <button class="btn" :disabled="running" @click="runAll">
           {{ running ? '验证中…' : '对全部映射重新验证' }}
         </button>
       </div>
+    </div>
+    <div v-if="lastRun" class="callout small" :class="lastRun.status === 'complete' ? 'ok' : 'bad'">
+      最近一次运行 #{{ lastRun.run_id }} 终态：<b>{{ lastRun.status_label }}</b>
+      <span v-if="lastRun.diagnostics?.length">——{{ lastRun.diagnostics.join('；') }}</span>
+      <span v-if="lastRun.status !== 'complete'">（当前证据仍来自上一个完整基线运行，未被本次覆盖）</span>
     </div>
 
     <div class="kpi" style="margin-top:12px">
@@ -50,7 +57,7 @@
             <span v-else class="muted small">无</span>
             <div class="small" v-if="row.verified_at">
               <a href="#" @click.prevent="showHops(row)">查看逐跳证据</a>
-              · {{ fmt(row.verified_at) }}
+              · 运行 #{{ row.run_id }} · {{ fmt(row.verified_at) }}
             </div>
           </td>
         </tr>
@@ -85,6 +92,7 @@ const label = ref({});
 const running = ref(false);
 const hops = ref([]);
 const hopsKey = ref('');
+const lastRun = ref(null);
 
 const counts = computed(() => {
   const c = { ok: 0, ambiguity: 0, loop: 0, long: 0, badStatus: 0, fetch: 0, unverified: 0 };
@@ -112,8 +120,19 @@ async function load() {
 }
 async function runAll() {
   running.value = true;
-  try { await api.verify(); await load(); }
-  finally { running.value = false; }
+  try {
+    const run = await api.startRun({});
+    // 轮询运行终态（complete / failed / cancelled）
+    for (;;) {
+      const d = await api.run(run.id);
+      if (d.run.terminal) {
+        lastRun.value = { run_id: run.id, status: d.run.status, status_label: d.run.status_label, diagnostics: d.run.diagnostics };
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    await load();
+  } finally { running.value = false; }
 }
 async function showHops(row) {
   hopsKey.value = row.source_norm;
