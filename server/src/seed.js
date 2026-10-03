@@ -45,12 +45,14 @@ const INPUTS = [
     mapping_type: 'deleted',
     note: '栏目已删除，期望 410 Gone',
   },
-  // 6) 重定向环：有人把环上两个地址互相填成了“迁移目标”
+  // 6) 重定向环：映射表声明的真实落点是科技文章 42，但站点配置把 /loop/a、/loop/b
+  //    互相跳转成环；修复是站点侧行为（FIXTURE_MODE=fixed 直跳到声明目标），
+  //    因此修复前后两次运行输入一致、可比较，该入口被列为“已修复”
   {
     source_raw: `${O}/loop/a`,
-    target_raw: `${O}/loop/b`,
+    target_raw: `${O}/articles/tech/42`,
     mapping_type: 'manual',
-    note: '已知环，验证必须报 redirect_loop',
+    note: '站点重定向配置成环，验证必须报 redirect_loop；修复后直跳科技文章 42',
   },
   // 7) 过长链：7 跳，超过上限 5
   {
@@ -87,7 +89,7 @@ export async function seed() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('TRUNCATE migration_plan_items, migration_plans, verification_verdicts, crawl_results, url_mappings, mapping_inputs RESTART IDENTITY');
+    await client.query('TRUNCATE migration_plan_items, migration_plans, run_crawl_hops, run_verdicts, verification_runs, verification_verdicts, crawl_results, url_mappings, mapping_inputs RESTART IDENTITY');
 
     for (const row of INPUTS) {
       const s = normalize(row.source_raw);

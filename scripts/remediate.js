@@ -4,7 +4,8 @@
  *  2. 删除错误的大小写录入 /News/123（旧站本无此资源）；
  *  3. 剔除非本站地址（example.com 不属于本次迁移范围）；
  *  4. 重算生效映射。
- * 长链与环的修复在站点侧（FIXTURE_MODE=fixed 模拟已上线的修复配置）。
+ * 环与长链的修复在站点侧（FIXTURE_MODE=fixed 模拟已上线的修复配置）：
+ * 映射表声明的落点不变，站点把环打断、把长链压成直跳。
  *
  * 运行：FIXTURE_MODE=fixed node scripts/remediate.js
  */
@@ -38,15 +39,6 @@ try {
 
   const { total, conflicted } = await recomputeMappings(client);
 
-  // 4) 环已在站点侧打断：修正映射目标为修复后的真实落点
-  const loopKey = normalize(`${O}/loop/a`).normKey;
-  const loopTarget = normalize(`${O}/articles/tech/42`);
-  await client.query(
-    `UPDATE url_mappings
-        SET target_raw=$2, target_norm=$3, note='环已打断，直跳到科技文章'
-      WHERE source_norm=$1`,
-    [loopKey, `${O}/articles/tech/42`, loopTarget.normKey]);
-  console.log('环修复：/loop/a 的映射目标更新为修复后的真实落点');
   console.log(`重算生效映射：${total} 条，冲突 ${conflicted} 条`);
   await client.query('COMMIT');
 } catch (e) {

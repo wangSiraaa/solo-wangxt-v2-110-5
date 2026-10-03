@@ -57,6 +57,68 @@ CREATE TABLE IF NOT EXISTS crawl_results (
   UNIQUE (source_norm, hop_index)
 );
 
+-- =====================================================================
+-- 版本化运行历史
+-- 每次验证运行冻结：输入映射版本（指纹+摘要）、规范化/白名单策略（指纹+快照）、
+-- 选择范围、逐跳链与最终裁决。终态：complete / failed / cancelled。
+-- 只有 complete 且与当前映射/策略兼容的全量运行才能作为发布基线；
+-- 中断、超时或局部失败的运行保留诊断，但绝不替换最后一个完整基线。
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id                  BIGSERIAL PRIMARY KEY,
+  -- running（进行中，非终态）/ complete / failed / cancelled
+  status              TEXT NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running','complete','failed','cancelled')),
+  scope               TEXT NOT NULL DEFAULT 'all' CHECK (scope IN ('all','keys')),
+  scope_keys          JSONB NOT NULL DEFAULT '[]'::jsonb,  -- scope=keys 时的入口键
+  -- 输入映射版本：对生效映射集合（source_norm,target_norm,type,status）的哈希
+  mapping_fingerprint TEXT NOT NULL,
+  mapping_summary     JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 总数/生效/冲突/录入数
+  -- 规范化 + 白名单 + 爬取策略版本
+  policy_fingerprint  TEXT NOT NULL,
+  policy_snapshot     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  fixture_mode        TEXT NOT NULL DEFAULT 'default',     -- 站点形态（仅记录，不参与兼容性）
+  totals              JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 各裁决计数
+  diagnostics         JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 中断/超时/局部失败诊断
+  started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at         TIMESTAMPTZ
+);
+
+-- 每次运行各自的最终裁决（不随新运行覆盖，旧运行证据可回看）
+CREATE TABLE IF NOT EXISTS run_verdicts (
+  run_id              BIGINT NOT NULL REFERENCES verification_runs(id) ON DELETE CASCADE,
+  source_norm         TEXT NOT NULL,
+  source_raw          TEXT NOT NULL,
+  verdict             TEXT NOT NULL,
+  issues              JSONB NOT NULL DEFAULT '[]'::jsonb,
+  final_url_raw       TEXT,
+  final_url_norm      TEXT,
+  final_status        INT,
+  hops                INT  NOT NULL DEFAULT 0,
+  tracker_preserved   BOOLEAN,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, source_norm)
+);
+
+-- 每次运行各自的逐跳链
+CREATE TABLE IF NOT EXISTS run_crawl_hops (
+  id                  BIGSERIAL PRIMARY KEY,
+  run_id              BIGINT NOT NULL REFERENCES verification_runs(id) ON DELETE CASCADE,
+  source_norm         TEXT NOT NULL,
+  hop_index           INT  NOT NULL,
+  url_raw             TEXT NOT NULL,
+  url_norm            TEXT NOT NULL,
+  status_code         INT,
+  location_raw        TEXT,
+  location_norm       TEXT,
+  is_redirect         BOOLEAN NOT NULL DEFAULT false,
+  fetch_error         TEXT,
+  fetched_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (run_id, source_norm, hop_index)
+);
+CREATE INDEX IF NOT EXISTS idx_run_crawl_hops_key ON run_crawl_hops(run_id, source_norm);
+
 -- 对每个入口地址的最终裁决（最终页面状态必须核实）
 CREATE TABLE IF NOT EXISTS verification_verdicts (
   source_norm         TEXT PRIMARY KEY,
@@ -93,3 +155,7 @@ CREATE TABLE IF NOT EXISTS migration_plan_items (
   evidence        JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE (plan_id, mapping_id)
 );
+
+-- 当前基线表记录产生它的运行（仅由 complete 运行更新）
+ALTER TABLE verification_verdicts ADD COLUMN IF NOT EXISTS run_id BIGINT;
+ALTER TABLE crawl_results        ADD COLUMN IF NOT EXISTS run_id BIGINT;

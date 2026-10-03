@@ -24,6 +24,15 @@ export const api = {
     }).then(j),
   crawl: (key) =>
     fetch('/api/crawl/' + encodeURIComponent(key)).then(j),
+  runs: () => fetch('/api/runs').then(j),
+  run: (id) => fetch(`/api/runs/${id}`).then(j),
+  runVerdicts: (id) => fetch(`/api/runs/${id}/verdicts`).then(j),
+  runCrawl: (id, key) =>
+    fetch(`/api/runs/${id}/crawl/` + encodeURIComponent(key)).then(j),
+  cancelRun: (id) => fetch(`/api/runs/${id}/cancel`, { method: 'POST' }).then(j),
+  compareRuns: (a, b) => fetch(`/api/runs/compare?a=${a}&b=${b}`).then(j),
+  runReportUrl: (id) => `/api/runs/${id}/report`,
+  compareReportUrl: (a, b) => `/api/runs/compare/report?a=${a}&b=${b}`,
   plans: () => fetch('/api/plans').then(j),
   plan: (id) => fetch(`/api/plans/${id}`).then(j),
   createPlan: (name) =>

@@ -1,8 +1,13 @@
-/** REST API：映射录入、规范化试算、验证、迁移方案与发布闸门。 */
+/** REST API：映射录入、规范化试算、验证、版本化运行历史、迁移方案与发布闸门。 */
 import { pool } from './db.js';
 import { normalize, carryTrackers, splitQuery } from './normalize.js';
 import { recomputeMappings } from './mappings-service.js';
-import { runVerification, VERDICT_LABEL } from './verify-runner.js';
+import { runVerification, requestCancel, VERDICT_LABEL } from './verify-runner.js';
+import {
+  RUN_STATUS_LABEL, currentInputVersion, compatibilityReasons,
+  getBaselineRun, getRun, getRunVerdicts, getRunHops,
+  compareRuns, buildRunReport, buildCompareReport,
+} from './run-store.js';
 import { config } from './config.js';
 
 export default async function api(app) {
@@ -30,17 +35,26 @@ export default async function api(app) {
     });
   });
 
-  // 全量材料：原始输入 + 生效映射 + 最新裁决
+  // 全量材料：原始输入 + 生效映射 + 最新裁决 + 当前基线运行状态
   app.get('/api/mappings', async () => {
     const { rows: inputs } = await pool.query(
       `SELECT i.*, v.verdict, v.issues, v.final_status, v.final_url_raw, v.hops,
-              v.tracker_preserved, v.verified_at
+              v.tracker_preserved, v.verified_at, v.run_id
          FROM mapping_inputs i
          LEFT JOIN verification_verdicts v ON v.source_norm = i.source_norm
         ORDER BY i.id`);
     const { rows: mappings } = await pool.query('SELECT * FROM url_mappings ORDER BY id');
     const { rows: ambiguities } = await pool.query('SELECT * FROM mapping_ambiguities ORDER BY source_norm');
-    return { inputs, mappings, ambiguities, verdictLabel: VERDICT_LABEL };
+    const baseline = await getBaselineRun();
+    return {
+      inputs, mappings, ambiguities, verdictLabel: VERDICT_LABEL,
+      baseline: {
+        run_id: baseline.run?.id ?? null,
+        started_at: baseline.run?.started_at ?? null,
+        reasons: baseline.reasons,
+        current: baseline.current,
+      },
+    };
   });
 
   // 录入一条原始映射：只进 mapping_inputs；随后重算 url_mappings 状态
@@ -71,7 +85,8 @@ export default async function api(app) {
 
   app.post('/api/verify', async (req) => {
     const onlyKey = req.body?.source_norm ?? null;
-    return runVerification({ onlyKey });
+    const r = await runVerification({ onlyKey });
+    return { ...r, run_id: r.run.id };
   });
 
   app.get('/api/crawl/:key', async (req, reply) => {
@@ -80,6 +95,112 @@ export default async function api(app) {
       'SELECT * FROM crawl_results WHERE source_norm=$1 ORDER BY hop_index', [key]);
     if (!rows.length) return reply.code(404).send({ error: 'no crawl evidence; run verification first' });
     return rows;
+  });
+
+  // ---- 版本化运行历史 -------------------------------------------------
+
+  // 运行列表：每次运行冻结的输入版本 + 终态 + 与当前输入的兼容性 + 是否当前基线
+  app.get('/api/runs', async () => {
+    const baseline = await getBaselineRun();
+    const { rows } = await pool.query(
+      'SELECT * FROM verification_runs ORDER BY id DESC');
+    const cur = baseline.current;
+    return {
+      current: cur,
+      baseline_run_id: baseline.run?.id ?? null,
+      baseline_reasons: baseline.reasons,
+      statusLabel: RUN_STATUS_LABEL,
+      runs: rows.map((r) => ({
+        ...r,
+        is_baseline: baseline.run?.id === r.id,
+        compatible_with_current:
+          r.mapping_fingerprint === cur.mappingFingerprint
+          && r.policy_fingerprint === cur.policyFingerprint,
+        incompatibility_reasons: compatibilityReasons(r, {
+          mapping_fingerprint: cur.mappingFingerprint,
+          policy_fingerprint: cur.policyFingerprint,
+        }),
+      })),
+    };
+  });
+
+  app.get('/api/runs/compare', async (req, reply) => {
+    const a = Number(req.query.a);
+    const b = Number(req.query.b);
+    if (!a || !b) return reply.code(400).send({ error: 'query a=<runId>&b=<runId> required' });
+    const cmp = await compareRuns(a, b);
+    if (cmp.error) return reply.code(404).send({ error: cmp.error });
+    return cmp;
+  });
+
+  // 比较报告导出（Markdown，带两次运行的标识与输入摘要）
+  app.get('/api/runs/compare/report', async (req, reply) => {
+    const a = Number(req.query.a);
+    const b = Number(req.query.b);
+    if (!a || !b) return reply.code(400).send({ error: 'query a=<runId>&b=<runId> required' });
+    const md = await buildCompareReport(a, b);
+    if (md == null) return reply.code(404).send({ error: 'run not found' });
+    return reply
+      .header('content-type', 'text/markdown; charset=utf-8')
+      .header('content-disposition', `attachment; filename="compare-run-${a}-vs-${b}.md"`)
+      .send(md);
+  });
+
+  app.get('/api/runs/:id', async (req, reply) => {
+    const run = await getRun(Number(req.params.id));
+    if (!run) return reply.code(404).send({ error: 'run not found' });
+    const cur = await currentInputVersion();
+    const baseline = await getBaselineRun();
+    return {
+      ...run,
+      status_label: RUN_STATUS_LABEL[run.status] ?? run.status,
+      is_baseline: baseline.run?.id === run.id,
+      compatible_with_current:
+        run.mapping_fingerprint === cur.mappingFingerprint
+        && run.policy_fingerprint === cur.policyFingerprint,
+      incompatibility_reasons: compatibilityReasons(run, {
+        mapping_fingerprint: cur.mappingFingerprint,
+        policy_fingerprint: cur.policyFingerprint,
+      }),
+      baseline_eligible:
+        run.status === 'complete' && run.scope === 'all'
+        && run.mapping_fingerprint === cur.mappingFingerprint
+        && run.policy_fingerprint === cur.policyFingerprint,
+    };
+  });
+
+  app.get('/api/runs/:id/verdicts', async (req, reply) => {
+    const run = await getRun(Number(req.params.id));
+    if (!run) return reply.code(404).send({ error: 'run not found' });
+    return getRunVerdicts(run.id);
+  });
+
+  // 某次运行中某入口的逐跳链（旧运行证据可回看）
+  app.get('/api/runs/:id/crawl/:key', async (req, reply) => {
+    const rows = await getRunHops(Number(req.params.id), decodeURIComponent(req.params.key));
+    if (!rows.length) return reply.code(404).send({ error: 'no hop evidence for this key in this run' });
+    return rows;
+  });
+
+  // 取消进行中的运行：已处理入口保留证据，运行被标为 cancelled（不完整）
+  app.post('/api/runs/:id/cancel', async (req, reply) => {
+    const run = await getRun(Number(req.params.id));
+    if (!run) return reply.code(404).send({ error: 'run not found' });
+    if (run.status !== 'running') {
+      return reply.code(409).send({ error: `运行已处于终态（${run.status}），无法取消` });
+    }
+    requestCancel(run.id);
+    return { cancelling: true, run_id: run.id };
+  });
+
+  // 单次运行报告导出（Markdown，带运行标识与输入摘要）
+  app.get('/api/runs/:id/report', async (req, reply) => {
+    const md = await buildRunReport(Number(req.params.id));
+    if (md == null) return reply.code(404).send({ error: 'run not found' });
+    return reply
+      .header('content-type', 'text/markdown; charset=utf-8')
+      .header('content-disposition', `attachment; filename="run-${req.params.id}-report.md"`)
+      .send(md);
   });
 
   // ---- 迁移方案 -------------------------------------------------------
@@ -94,7 +215,15 @@ export default async function api(app) {
          FROM migration_plans p
          LEFT JOIN migration_plan_items pi ON pi.plan_id=p.id
         GROUP BY p.id ORDER BY p.id`);
-    return rows;
+    const baseline = await getBaselineRun();
+    return {
+      plans: rows,
+      baseline: {
+        run_id: baseline.run?.id ?? null,
+        started_at: baseline.run?.started_at ?? null,
+        reasons: baseline.reasons,
+      },
+    };
   });
 
   app.post('/api/plans', async (req, reply) => {
@@ -127,7 +256,7 @@ export default async function api(app) {
 
       const { rows: ms } = await client.query(
         `SELECT m.*, v.verdict, v.issues, v.final_status, v.final_url_raw,
-                v.final_url_norm, v.hops, v.tracker_preserved
+                v.final_url_norm, v.hops, v.tracker_preserved, v.run_id AS verdict_run_id
            FROM url_mappings m
            LEFT JOIN verification_verdicts v ON v.source_norm=m.source_norm
           WHERE m.status='active' ORDER BY m.id`);
@@ -152,6 +281,7 @@ export default async function api(app) {
              final_url: m.final_url_raw ?? null,
              hops: m.hops ?? 0,
              tracker_preserved: m.tracker_preserved ?? null,
+             run_id: m.verdict_run_id ?? null,
              proposed_redirect_url: proposed,
            })]);
       }
@@ -176,11 +306,11 @@ export default async function api(app) {
 
   /**
    * 发布闸门：
+   *  - 必须存在“完整（complete）+ 全量 + 与当前映射/策略指纹兼容”的基线运行；
+   *    映射或策略一旦变化，旧运行立即失去放行资格（409 并说明原因）；
    *  - 不存在 blocked/pending 条目（每条都必须有成功验证的证据）；
    *  - 不存在未纳入方案的 active 映射；
-   *  - 不存在 conflicted 映射；
-   *  - 验证证据必须是最近一次（verified_at 晚于映射/输入更新）——这里以
-   *    每条 evidence.verdict 为 ok/deleted_gone_ok 为准。
+   *  - 不存在 conflicted 映射。
    * 任何一条不满足都拒绝发布并列出受影响链接。
    */
   app.post('/api/plans/:id/publish', async (req, reply) => {
@@ -191,6 +321,14 @@ export default async function api(app) {
     if (!plan.length) return reply.code(404).send({ error: 'not found' });
     if (plan[0].status === 'published') {
       return { alreadyPublished: true, plan: plan[0] };
+    }
+
+    // 运行级闸门：只有完整且与当前输入兼容的基线运行才能作为发布依据
+    const baseline = await getBaselineRun();
+    if (!baseline.run) {
+      for (const r of baseline.reasons) {
+        blockers.push({ source: '（发布闸门）', reason: `无可用基线运行：${r}` });
+      }
     }
 
     const { rows: badItems } = await pool.query(
@@ -207,6 +345,23 @@ export default async function api(app) {
       });
     }
 
+    // 条目证据必须来自当前基线运行（防止用旧运行/局部运行的证据蒙混）
+    if (baseline.run) {
+      const { rows: stale } = await pool.query(
+        `SELECT m.source_raw, pi.evidence
+           FROM migration_plan_items pi
+           JOIN url_mappings m ON m.id=pi.mapping_id
+          WHERE pi.plan_id=$1 AND pi.item_status='verified'
+            AND (pi.evidence->>'run_id')::bigint IS DISTINCT FROM $2`,
+        [planId, baseline.run.id]);
+      for (const s of stale) {
+        blockers.push({
+          source: s.source_raw,
+          reason: `证据来自运行 #${s.evidence?.run_id ?? '?'}，不是当前基线运行 #${baseline.run.id}；请重新 build 方案`,
+        });
+      }
+    }
+
     const { rows: missing } = await pool.query(
       `SELECT m.source_raw FROM url_mappings m
         WHERE m.status='active'
@@ -219,12 +374,15 @@ export default async function api(app) {
     conflicts.forEach((m) => blockers.push({ source: m.source_raw, reason: '归一化歧义未裁决' }));
 
     if (blockers.length) {
-      return reply.code(409).send({ published: false, blockers });
+      return reply.code(409).send({
+        published: false, blockers,
+        baseline_run_id: baseline.run?.id ?? null,
+      });
     }
 
     const { rows } = await pool.query(
       `UPDATE migration_plans SET status='published', published_at=now()
         WHERE id=$1 RETURNING *`, [planId]);
-    return { published: true, plan: rows[0] };
+    return { published: true, plan: rows[0], baseline_run_id: baseline.run.id };
   });
 }

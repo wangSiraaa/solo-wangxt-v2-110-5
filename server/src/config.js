@@ -52,6 +52,10 @@ export const config = {
     maxRedirects: num(process.env.MAX_REDIRECTS, 5),
     timeoutMs: num(process.env.HTTP_TIMEOUT_MS, 4000),
   },
+  verify: {
+    /** 测试/演示钩子：每处理一条映射前的停顿，便于复现“运行中取消” */
+    stepDelayMs: num(process.env.VERIFY_STEP_DELAY_MS, 0),
+  },
 };
 
 export function fixtureOrigin() {

@@ -19,7 +19,9 @@ const fixtureMode = process.env.FIXTURE_MODE === 'fixed' ? 'fixed（整改修复
 const fixture = await buildFixtureApp();
 await fixture.listen({ host: config.fixture.host, port: config.fixture.port });
 try {
-  await runVerification();
+  const { run } = await runVerification();
+  const ms = run.mapping_summary ?? {};
+  const ps = run.policy_snapshot ?? {};
 
   const { rows: verdicts } = await pool.query(
     'SELECT * FROM verification_verdicts ORDER BY source_norm');
@@ -46,9 +48,14 @@ try {
   let md = `# 栏目改版：旧链接落地验证报告（发布前证据）
 
 > 生成时间：${now}
+> **验证运行：#${run.id}（${run.status}）**　开始：${new Date(run.started_at).toISOString()}
+>
+> 输入摘要（运行开始时冻结）：
+> 映射指纹 \`${run.mapping_fingerprint}\`（生效映射 ${ms.total} 条：生效 ${ms.active} / 冲突 ${ms.conflicted}，原始录入 ${ms.inputs} 条）；
+> 策略指纹 \`${run.policy_fingerprint}\`（尾斜杠 \`${ps.normalize?.tailSlashMode}\`，最多 ${ps.crawl?.maxRedirects} 跳，单跳超时 ${ps.crawl?.timeoutMs} ms）
+>
 > 验证目标白名单：\`http://${config.fixture.host}:${config.fixture.port}\`（随项目启动的本地站点，仅此一个）
 > 本地站点模式：**${fixtureMode}**
-> 最长跳转链：${config.crawl.maxRedirects} 跳；尾斜杠策略：\`${config.rules.tailSlashMode}\`（保留）
 >
 > **结论先行：${blocked.length === 0 ? '全部通过，可以发布' : `存在 ${blocked.length} 条受影响链接未通过，发布闸门保持关闭`}。**
 > 映射表填完不等于迁移完成——下表每条都以真实 HTTP 请求的逐跳证据为准。

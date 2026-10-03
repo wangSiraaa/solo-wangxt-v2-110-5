@@ -14,6 +14,26 @@
       </div>
     </div>
 
+    <div v-if="baseline" class="callout" :class="baseline.run_id ? 'ok' : 'bad'">
+      <template v-if="baseline.run_id">
+        当前发布基线：<b>运行 #{{ baseline.run_id }}</b>（{{ fmt(baseline.started_at) }}）。
+        中断/超时/局部失败的运行不会顶替它。
+      </template>
+      <template v-else>
+        <b>没有完整且与当前输入兼容的基线运行：</b>
+        <span v-for="(r, i) in baseline.reasons" :key="i" style="display:block">· {{ r }}</span>
+      </template>
+    </div>
+    <div v-if="lastRun" class="callout" :class="lastRun.status === 'complete' ? 'ok' : 'bad'">
+      本次验证 = <b>运行 #{{ lastRun.run_id }}</b>，终态：<b>{{ lastRun.status }}</b>
+      <template v-if="lastRun.status !== 'complete'">
+        —— 该运行不完整，仅保留诊断，发布闸门仍使用上一完整兼容基线。
+      </template>
+      <ul v-if="lastRun.diagnostics && lastRun.diagnostics.length" class="issues">
+        <li v-for="(d, i) in lastRun.diagnostics" :key="i">[{{ d.level }}] {{ d.message }}</li>
+      </ul>
+    </div>
+
     <div class="kpi" style="margin-top:12px">
       <div class="card"><div class="num" style="color:var(--ok)">{{ counts.ok }}</div><div class="lbl">通过（含已删除正确消亡）</div></div>
       <div class="card"><div class="num" style="color:var(--warn)">{{ counts.ambiguity }}</div><div class="lbl">归一化歧义</div></div>
@@ -85,6 +105,8 @@ const label = ref({});
 const running = ref(false);
 const hops = ref([]);
 const hopsKey = ref('');
+const baseline = ref(null);
+const lastRun = ref(null);
 
 const counts = computed(() => {
   const c = { ok: 0, ambiguity: 0, loop: 0, long: 0, badStatus: 0, fetch: 0, unverified: 0 };
@@ -103,6 +125,7 @@ const counts = computed(() => {
 async function load() {
   const d = await api.mappings();
   label.value = d.verdictLabel;
+  baseline.value = d.baseline;
   // 输入材料去重为每个归一化键一行展示
   const byKey = new Map();
   for (const i of d.inputs) {
@@ -112,7 +135,10 @@ async function load() {
 }
 async function runAll() {
   running.value = true;
-  try { await api.verify(); await load(); }
+  try {
+    lastRun.value = await api.verify();
+    await load();
+  }
   finally { running.value = false; }
 }
 async function showHops(row) {

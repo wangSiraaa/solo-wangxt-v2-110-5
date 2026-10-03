@@ -24,6 +24,12 @@
 5. **PostgreSQL 保存三类数据**：旧新映射（原始材料 `mapping_inputs` + 生效表
    `url_mappings`）、爬取逐跳结果（`crawl_results`）、迁移方案（`migration_plans`
    / `migration_plan_items`），另存每入口最终裁决 `verification_verdicts`。
+6. **版本化运行历史**：每次验证是一个“运行”（`verification_runs`），启动时冻结
+   输入映射版本（指纹+摘要）、规范化/白名单策略（指纹+快照）与选择范围；
+   逐跳链与裁决按运行隔离保存（`run_crawl_hops` / `run_verdicts`），旧运行证据可回看。
+   终态：`complete` / `failed` / `cancelled`。只有 **complete + 全量 + 与当前
+   映射/策略指纹兼容** 的运行才是发布基线；取消、超时、局部失败的运行保留诊断，
+   但绝不顶替上一个完整基线。
 
 ## 快速开始
 
@@ -36,7 +42,7 @@ npm run pg:start        # 启动 tools/ 下的本地 PostgreSQL（127.0.0.1:5543
 npm run migrate         # 建库 + 建表
 npm run seed            # 写入 10 条演示录入（含全部异常场景）
 
-npm test                # 19 项测试：规范化规则 + 验证器集成（真实启动本地站点）
+npm test                # 28 项测试：规范化规则 + 验证器集成 + 运行历史验收（真实启动本地站点）
 npm run verify          # CLI：对全部映射真实请求验证并给出裁决
 node scripts/report.js  # 产出 docs/verification-report-before.md 风格的证据报告
 
@@ -70,7 +76,7 @@ npm run seed && npm run verify
 
 # 2) 业务与运维修复：
 #    - 站点侧打断环、长链改直跳（FIXTURE_MODE=fixed 模拟已上线配置）
-#    - scripts/remediate.js：裁决歧义、剔除错误录入和非本站地址、更新映射目标
+#    - scripts/remediate.js：裁决歧义、剔除错误录入和非本站地址
 FIXTURE_MODE=fixed node scripts/remediate.js
 FIXTURE_MODE=fixed npm run verify
 #  → 共 7 条，全部通过（含 1 条已删除正确 410）
@@ -82,7 +88,25 @@ FIXTURE_MODE=fixed node scripts/report.js
 
 工作台里的“迁移方案”也遵循同样闸门：纳入方案只是 `pending`，
 `build` 时按最新裁决标注 `verified/blocked`；`publish` 时只要存在
-blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 + 受影响链接清单**。
+blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 + 受影响链接清单**；
+并且必须存在**完整且与当前映射/策略兼容的基线运行**、方案条目证据全部来自该运行，
+否则同样 409 并说明哪个运行为什么不能作为基线。
+
+## 版本化运行历史与比较
+
+- 每次 `POST /api/verify`（或 `npm run verify`）产生一个运行：冻结映射指纹、
+  策略快照、范围；逐跳证据与裁决按运行保存，旧运行随时可回看。
+- `GET /api/runs` 列出全部运行及其与当前输入的兼容性、当前基线；
+  `GET /api/runs/:id` 给出该运行的诊断与“能否作为基线”的明确结论。
+- `GET /api/runs/compare?a=X&b=Y` 按同一原始入口 + 规范化键对齐两次运行，
+  输出 **新增失败 / 已修复 / 状态回退 / 通过但证据变化 / 不可比较**；
+  映射或策略指纹不同则直接判定**输入不兼容**，旧 run 不能给新方案放行。
+- `GET /api/runs/:id/report`、`GET /api/runs/compare/report?a=X&b=Y`
+  导出 Markdown 报告，带运行编号、指纹与输入摘要。
+- `POST /api/runs/:id/cancel` 取消进行中的运行：已处理入口保留证据，
+  运行标记 `cancelled`，发布闸门继续使用上一完整兼容基线。
+- 任何入口出现网络级失败（本地站点超时/不可达）即整运行为 `failed`（局部失败），
+  诊断落库，基线表不被污染。
 
 ## API 摘要
 
@@ -90,8 +114,11 @@ blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 +
 |---|---|
 | `POST /api/normalize` | 规范化试算（不写库） |
 | `GET/POST /api/mappings` | 原始录入材料 / 录入一条（自动重算生效与冲突） |
-| `POST /api/verify` | 对全部（或指定 `source_norm`）真实验证 |
-| `GET /api/crawl/:key` | 查看某条链接的逐跳证据 |
+| `POST /api/verify` | 对全部（或指定 `source_norm`）真实验证，产生一个版本化运行 |
+| `GET /api/crawl/:key` | 查看某条链接当前基线的逐跳证据 |
+| `GET /api/runs`、`GET /api/runs/:id`、`GET /api/runs/:id/verdicts`、`GET /api/runs/:id/crawl/:key` | 运行历史与按运行回看的逐跳证据 |
+| `POST /api/runs/:id/cancel` | 取消进行中的运行（标记 cancelled，不顶替基线） |
+| `GET /api/runs/compare?a=&b=`、`GET /api/runs/compare/report?a=&b=`、`GET /api/runs/:id/report` | 运行比较与报告导出（带运行标识与输入摘要） |
 | `GET/POST /api/plans`、`POST /api/plans/:id/build`、`POST /api/plans/:id/publish` | 方案与发布闸门 |
 
 ## 环境变量（见 `.env.example`）
@@ -120,11 +147,12 @@ cd /workspace && npm run pg:start
 
 ```
 server/src/   normalize.js(规范化规则) verifier.js(白名单/环/长链/最终状态)
-              ambiguity.js mappings-service.js verify-runner.js
-              fixture.js(随项目本地站点) routes.js(Fastify) db.js
+              ambiguity.js mappings-service.js verify-runner.js(版本化运行)
+              run-store.js(指纹/基线/比较/报告) fixture.js(随项目本地站点)
+              routes.js(Fastify) db.js
 server/sql/   schema.sql
-web/          Vue 3 + Vite 工作台（总览/证据/方案闸门/规则四页）
+web/          Vue 3 + Vite 工作台（总览/证据/运行历史与比较/方案闸门/规则五页）
 scripts/      start-pg.js remediate.js report.js
 docs/         verification-report-before.md / -after.md（真实跑出来的证据）
-server/test/  规则单测 + 验证器集成测试（19 项）
+server/test/  规则单测 + 验证器集成 + 运行历史验收（28 项）
 ```

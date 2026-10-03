@@ -3,8 +3,19 @@
     <h2>迁移方案</h2>
     <p class="muted small">
       “纳入方案”只是 pending；执行验证后，证据齐全且裁决通过才是 verified。
-      发布闸门拒绝任何 blocked/pending、未纳入的生效映射或未裁决歧义。
+      发布闸门拒绝任何 blocked/pending、未纳入的生效映射或未裁决歧义；
+      且必须存在<b>完整（complete）且与当前映射/策略兼容的基线运行</b>，
+      方案条目证据必须来自该运行。
     </p>
+    <div v-if="baseline" class="callout" :class="baseline.run_id ? 'ok' : 'bad'">
+      <template v-if="baseline.run_id">
+        发布依据：基线运行 <b>#{{ baseline.run_id }}</b>（{{ fmt(baseline.started_at) }}）
+      </template>
+      <template v-else>
+        <b>当前不可发布——无完整兼容的基线运行：</b>
+        <span v-for="(r, i) in baseline.reasons" :key="i" style="display:block">· {{ r }}</span>
+      </template>
+    </div>
     <div class="row" style="align-items:flex-end">
       <label class="field" style="flex:3">
         <span>方案名称</span>
@@ -49,7 +60,7 @@
       </div>
     </div>
     <div v-else-if="lastPublish?.published" class="callout ok">
-      ✅ 已发布。每条链接均有最终页面状态与逐跳证据。
+      ✅ 已发布（依据基线运行 #{{ lastPublish.baseline_run_id }}）。每条链接均有最终页面状态与逐跳证据。
     </div>
     <table>
       <thead><tr><th>状态</th><th>旧址</th><th>计划目标（含保留的追踪参数）</th><th>裁决证据</th></tr></thead>
@@ -63,7 +74,9 @@
           <td class="mono">{{ it.source_raw }}</td>
           <td class="mono">{{ it.evidence?.proposed_redirect_url || '（已删除，返回 410/404）' }}</td>
           <td class="small">
-            <div>最终状态：{{ it.evidence?.final_status ?? '—' }}；跳数：{{ it.evidence?.hops ?? '—' }}</div>
+            <div>最终状态：{{ it.evidence?.final_status ?? '—' }}；跳数：{{ it.evidence?.hops ?? '—' }}
+              <span v-if="it.evidence?.run_id" class="muted">· 证据来自运行 #{{ it.evidence.run_id }}</span>
+            </div>
             <ul v-if="it.evidence?.issues?.length" class="issues">
               <li v-for="(x, k) in it.evidence.issues" :key="k">{{ x }}</li>
             </ul>
@@ -83,8 +96,14 @@ const plans = ref([]);
 const newName = ref('');
 const detail = ref(null);
 const lastPublish = ref(null);
+const baseline = ref(null);
 
-async function load() { plans.value = await api.plans(); if (detail.value) await open(detail.value.plan.id); }
+async function load() {
+  const d = await api.plans();
+  plans.value = d.plans;
+  baseline.value = d.baseline;
+  if (detail.value) await open(detail.value.plan.id);
+}
 async function create() {
   if (!newName.value.trim()) return;
   await api.createPlan(newName.value.trim());
@@ -104,6 +123,7 @@ async function publish(id) {
 function statusText(s) {
   return { draft: '草稿', ready: '就绪', published: '已发布' }[s] || s;
 }
+function fmt(ts) { return ts ? new Date(ts).toLocaleString('zh-CN') : '—'; }
 watch(() => props.refreshKey, load);
 onMounted(load);
 </script>
